@@ -205,8 +205,9 @@ export default function MatchPotentialPredictor() {
     setLoading(true);
     setError(null);
 
-    try {
-      const response = await fetch('http://localhost:8000/predict', {
+try {
+      // Notice the backticks (` `) wrapping the URL string here
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/predict`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(formData),
