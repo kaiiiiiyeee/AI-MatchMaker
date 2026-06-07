@@ -4,18 +4,41 @@ from typing import List
 import pandas as pd
 import joblib
 import numpy as np
+import sys
+from fastapi.middleware.cors import CORSMiddleware
+
 
 # Initialize the FastAPI app
 app = FastAPI(title="The (Data) Knot API")
 
-# Load the models globally when the app starts
+
+# 1. Define the tokenizer function
+def custom_tokenizer(text):
+    return [tag.strip() for tag in str(text).split(",")]
+
+
+# 2. INJECT into the active __main__ module namespace so joblib/pickle can locate it
+import __main__
+
+__main__.custom_tokenizer = custom_tokenizer
+sys.modules["__main__"].custom_tokenizer = custom_tokenizer
+
+
+# Load the Scaler, the SMOTE Model, Feature Columns, and the Vectorizer
 try:
     scaler = joblib.load("dating_scaler.pkl")
-    model = joblib.load("dating_rf_model.pkl")
+    model = joblib.load("dating_rf_model_smote.pkl")
+    expected_cols = joblib.load("feature_columns.pkl")
+    # This will now successfully look up the injected function name!
+    vectorizer = joblib.load("interest_vectorizer.pkl")
 
-    expected_cols = joblib.load("expected_columns.pkl")
 except Exception as e:
-    print(f"Error loading models: {e}")
+    import traceback
+
+    print("====== ERROR CRASH REPORT ======")
+    traceback.print_exc()
+    print("================================")
+    raise HTTPException(status_code=400, detail=str(e))
 
 
 # Define the expected incoming JSON payload from Next.js
@@ -41,10 +64,10 @@ class UserProfile(BaseModel):
 @app.post("/predict")
 async def predict_success(profile: UserProfile):
     try:
-        # 1. Convert the incoming Pydantic object to a dictionary (Updated for Pydantic V2)
+        # Convert the incoming Pydantic object to a dictionary
         user_data = pd.DataFrame([profile.model_dump()])
 
-        # 2. Replicate Ordinal Encoding
+        # Replicate Ordinal Encoding
         income_mapping = {
             "Very Low": 0,
             "Low": 1,
@@ -69,40 +92,46 @@ async def predict_success(profile: UserProfile):
             user_data["education_level"].map(education_mapping).fillna(-1)
         )
 
-        # 3. Handle Interest Tags
-        all_possible_interests = [
-            "tech",
-            "yoga",
-            "sneaker culture",
-            "traveling",
-            "writing",
-        ]
-        for interest in all_possible_interests:
-            user_data[interest] = 1 if interest in profile.interest_tags else 0
+        # ---------------------------------------------------------
+        # ALIGNED INTEREST PROCESSING (Using training vectorizer)
+        # ---------------------------------------------------------
+        # Join the list of tags into a single comma-separated string
+        interest_string = ", ".join(profile.interest_tags)
 
-        user_data = user_data.drop(columns=["interest_tags"])
+        # Transform using the exported vectorizer and convert to DataFrame
+        interest_counts = vectorizer.transform([interest_string]).toarray()
+        interest_df = pd.DataFrame(
+            interest_counts, columns=vectorizer.get_feature_names_out()
+        )
 
-        # 4. One-Hot Encoding for text categories
+        # Combine back with the primary user data and drop the raw tags column
+        user_data = pd.concat(
+            [user_data.drop(columns=["interest_tags"]), interest_df], axis=1
+        )
+        # ---------------------------------------------------------
+
+        # One-Hot Encoding for text categories
         nominal_cols = [
             "gender",
             "sexual_orientation",
             "location_type",
             "swipe_time_of_day",
         ]
-        user_data = pd.get_dummies(user_data, columns=nominal_cols)
 
-        # 5. Column Alignment (CRITICAL)
-        # You must define expected_cols or load it via joblib for this to work
+        # FIXED: Added drop_first=True to match your training code
+        user_data = pd.get_dummies(user_data, columns=nominal_cols, drop_first=True)
+
+        # Column Alignment
+        # This automatically aligns the features and fills missing ones with 0
         user_data = user_data.reindex(columns=expected_cols, fill_value=0)
 
-        # 6. Apply Standard Scaling
+        # Apply Standard Scaling
         user_data_scaled = scaler.transform(user_data)
 
-        # 7. Make the Prediction
+        # Make the Prediction using the SMOTE model
         prediction_probabilities = model.predict_proba(user_data_scaled)
         success_probability = round(prediction_probabilities[0][1] * 100, 2)
 
-        # 8. Return the payload
         return {
             "status": "success",
             "match_probability_percentage": success_probability,
@@ -113,12 +142,11 @@ async def predict_success(profile: UserProfile):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-from fastapi.middleware.cors import CORSMiddleware
-
+# Allow Next.js to talk to FastAPI
 # Allow Next.js to talk to FastAPI
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Next.js frontend
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
